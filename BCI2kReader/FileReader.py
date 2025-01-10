@@ -31,6 +31,7 @@ import sys
 import struct
 import time
 import codecs
+import io
 
 try:
     import numpy
@@ -425,23 +426,33 @@ def ReadPrmFile(f):
     return p
 
 
-def ParseParam(param):
-    param = param.strip().split('//', 1)
-    comment = ''
-    if len(param) > 1:
-        comment = param[1].strip()
+def GetLine(stream, e = b'\n'):
+    line = []
+    c = stream.read(1)
+    while (c != b'' and c != e):
+        line.append(c)
+        c = stream.read(1)
+    return str(b''.join(line), 'utf-8')
 
-    param = param[0].split()
-    category = [unescape(x) for x in param.pop(0).split(':')]
-    param = [unescape(x) for x in param]
-    category += [''] * (3 - len(category))
-    if len(
-            category) > 3:  # this shouldn't happen, but some modules seem to register parameters with the string '::' inside one of the category elements. Let's assume this only happens in the third element
-        category = category[:2] + [':'.join(category[2:])]
-    datatype = param.pop(0)
-    name = param.pop(0).rstrip('=')
+
+def GetParamToken(stream):
+    c = stream.read(1)
+    while (c == b' '):
+        c = stream.read(1)
+    t = []
+    while (c != b'' and c != b' '):
+        t.append(c)
+        c = stream.read(1)
+    return str(b''.join(t), 'utf-8')
+
+
+def ParseParam(param):
+    stream = io.BytesIO(bytes(param, 'utf-8'))
+    category = unescape(GetParamToken(stream))
+    datatype = unescape(GetParamToken(stream))
+    name = unescape(GetParamToken(stream)).rstrip('=')
     rec = {
-        'name': name, 'comment': comment, 'category': category, 'type': datatype,
+        'name': name, 'comment': '', 'category': category, 'type': datatype,
         'defaultVal': '', 'minVal': '', 'maxVal': '',
     }
 
@@ -449,7 +460,7 @@ def ParseParam(param):
     if datatype in ('int', 'float'):
         datatypestr = datatype
         datatype = {'float': float, 'int': int}.get(datatype)
-        val = param[0]
+        val = unescape(GetParamToken(stream))
         unscaled, units, scaled = DecodeUnits(val, datatype)
         if isinstance(unscaled, (str, type(None))): Warn(
             'failed to interpret "%s" as type %s in parameter "%s"' % (val, datatypestr, name))
@@ -460,7 +471,7 @@ def ParseParam(param):
         })
 
     elif datatype in ('string', 'variant'):
-        val = param.pop(0)
+        val = unescape(GetParamToken(stream))
         rec.update({
             'valstr': val,
             'val': val,
@@ -471,9 +482,14 @@ def ParseParam(param):
         valtypestr = valtype
         valtype = {'float': float, 'int': int, '': str, 'string': str, 'variant': str}.get(valtype, valtype)
         if isinstance(valtype, str): raise DatFileError('Unknown list type "%s"' % datatype)
-        numel, labels, labelstr = ParseDim(param)
-        val = param[:numel]
-        valstr = ' '.join(filter(len, [labelstr] + val))
+        numel, labels, labelstr = ParseDim(stream)
+        val = []
+        for i in range(0, numel):
+            t = GetParamToken(stream)
+            if not len(t): Warn('not enough values in parameter "%s"' % name)
+            val.append(unescape(t))
+
+        valstr = ' '.join([labelstr] + val)
         if valtype == str:
             unscaled = val
             units = [''] * len(val)
@@ -499,14 +515,21 @@ def ParseParam(param):
         valtype = datatype[:-6]
         valtype = {'float': float, 'int': int, '': str, 'string': str, 'variant': str}.get(valtype, valtype)
         if isinstance(valtype, str): raise DatFileError('Unknown matrix type "%s"' % valtype)
-        nrows, rowlabels, rowlabelstr = ParseDim(param)
-        ncols, collabels, collabelstr = ParseDim(param)
-        valstr = ' '.join(filter(len, [rowlabelstr, collabelstr] + param[:nrows * ncols]))
+        nrows, rowlabels, rowlabelstr = ParseDim(stream)
+        ncols, collabels, collabelstr = ParseDim(stream)
+
+        values = []
+        for i in range(0, nrows * ncols):
+            t = GetParamToken(stream)
+            if not len(t): Warn('not enough values in parameter "%s"' % name)
+            values.append(unescape(t))
+
+        valstr = ' '.join(filter(len, [rowlabelstr, collabelstr] + values))
         val = []
         for i in range(nrows):
             val.append([])
             for j in range(ncols):
-                val[-1].append(param.pop(0))
+                val[-1].append(values.pop(0))
         rec.update({
             'valstr': valstr,
             'valtype': valtype,
@@ -517,34 +540,57 @@ def ParseParam(param):
 
     else:
         Warn("unsupported parameter type %r" % datatype)
+        val = unescape(GetParamToken(stream))
         rec.update({
-            'valstr': ' '.join(param),
-            'val': param,
+            'valstr': val,
+            'val': val,
         })
 
-    param.reverse()
-    if len(param): rec['maxVal'] = param.pop(0)
-    if len(param): rec['minVal'] = param.pop(0)
-    if len(param): rec['defaultVal'] = param.pop(0)
+    vals = []
+    t = GetParamToken(stream)
+    while len(t):
+        if t.find('//') == 0:
+            break
+        vals.append(unescape(t))
+        t = GetParamToken(stream)
+
+    if len(vals): rec['defaultVal'] = vals.pop(0)
+    if len(vals): rec['minVal'] = vals.pop(0)
+    if len(vals): rec['maxVal'] = vals.pop(0)
+    if len(vals): Warn('%d extra value(s) in parameter %s' % (len(vals), name))
+
+    t = t.split('//')
+    t = t[-1]
+    comment = ' '.join([t, GetLine(stream)])
+    rec['comment'] = comment.strip()
 
     if scaled is None:
         rec['scaled'] = rec['val']
     else:
         rec['scaled'] = scaled
+    stream.close()
     return rec
 
 
-def ParseDim(param):
-    extent = param.pop(0)
+def ParseDim(stream):
+    extent = 0
     labels = []
-    if extent == '{':
+    labelstr = ''
+
+    t = GetParamToken(stream)
+    if t.startswith('{'):
+        t = t[:2]
+        line = t + GetLine(stream, b'}')
+        labelstr = '{ ' + line + ' }'
+        stream2 = io.BytesIO(line)
         while True:
-            p = param.pop(0)
-            if p == '}': break
-            labels.append(p)
+            t2 = GetParamToken(stream2)
+            if t2 == '': break
+            labels.append(unescape(t))
+        stream2.close()
         extent = len(labels)
-        labelstr = ' '.join(['{'] + labels + ['}'])
     else:
+        extent = unescape(t)
         labelstr = extent
         extent = int(extent)
         labels = [str(x) for x in range(1, extent + 1)]
