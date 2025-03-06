@@ -579,14 +579,13 @@ def ParseDim(stream):
 
     t = GetParamToken(stream)
     if t.startswith('{'):
-        t = t[:2]
-        line = t + GetLine(stream, b'}')
+        line = GetLine(stream, b'}')
         labelstr = '{ ' + line + ' }'
-        stream2 = io.BytesIO(line)
+        stream2 = io.BytesIO(bytes(line, 'utf-8'))
         while True:
             t2 = GetParamToken(stream2)
             if t2 == '': break
-            labels.append(unescape(t))
+            labels.append(unescape(t2))
         stream2.close()
         extent = len(labels)
     else:
